@@ -23,16 +23,31 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { Copy } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
 
-function buildWsUrl(token: string, resume: string | null): string {
+function buildWsUrl(
+  token: string,
+  resume: string | null,
+  channel: string,
+): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const qs = new URLSearchParams({ token });
+  const qs = new URLSearchParams({ token, channel });
   if (resume) qs.set("resume", resume);
   return `${proto}//${window.location.host}/api/pty?${qs.toString()}`;
+}
+
+// Channel id ties this chat tab's PTY child (publisher) to its sidebar
+// (subscriber).  Generated once per mount so a tab refresh starts a fresh
+// channel — the previous PTY child terminates with the old WS, and its
+// channel auto-evicts when no subscribers remain.
+function generateChannelId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `chat-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
 }
 
 // Colors for the terminal body.  Matches the dashboard's dark teal canvas
@@ -64,6 +79,7 @@ export default function ChatPage() {
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const resumeRef = useRef<string | null>(searchParams.get("resume"));
+  const channel = useMemo(() => generateChannelId(), []);
 
   const handleCopyLast = () => {
     const ws = wsRef.current;
@@ -269,7 +285,7 @@ export default function ChatPage() {
     });
 
     // WebSocket
-    const url = buildWsUrl(token, resumeRef.current);
+    const url = buildWsUrl(token, resumeRef.current, channel);
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
@@ -385,7 +401,7 @@ export default function ChatPage() {
         copyResetRef.current = null;
       }
     };
-  }, []);
+  }, [channel]);
 
   // Layout:
   //   outer flex column — sits inside the dashboard's content area
@@ -444,7 +460,7 @@ export default function ChatPage() {
         </div>
 
         <div className="hidden min-h-0 lg:block">
-          <ChatSidebar />
+          <ChatSidebar channel={channel} />
         </div>
       </div>
     </div>

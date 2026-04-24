@@ -89,3 +89,37 @@ class StdioTransport:
 
     def close(self) -> None:
         return None
+
+
+class TeeTransport:
+    """Mirrors writes to one primary plus N best-effort secondaries.
+
+    The primary's return value (and exceptions) determine the result —
+    secondaries swallow failures so a wedged sidecar never stalls the
+    main IO path.  Used by the PTY child so every dispatcher emit lands
+    on stdio (Ink) AND on a back-WS feeding the dashboard sidebar.
+    """
+
+    __slots__ = ("_primary", "_secondaries")
+
+    def __init__(self, primary: "Transport", *secondaries: "Transport") -> None:
+        self._primary = primary
+        self._secondaries = secondaries
+
+    def write(self, obj: dict) -> bool:
+        for sec in self._secondaries:
+            try:
+                sec.write(obj)
+            except Exception:
+                pass
+        return self._primary.write(obj)
+
+    def close(self) -> None:
+        try:
+            self._primary.close()
+        finally:
+            for sec in self._secondaries:
+                try:
+                    sec.close()
+                except Exception:
+                    pass

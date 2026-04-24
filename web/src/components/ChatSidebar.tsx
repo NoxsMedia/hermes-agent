@@ -2,29 +2,25 @@
  * ChatSidebar — structured-events panel that sits next to the xterm.js
  * terminal in the dashboard Chat tab.
  *
- * The terminal pane (`<ChatPage>`) renders the literal TUI process via PTY
- * — full fidelity, byte-identical to `hermes --tui` in a regular terminal.
- * That's the canonical chat surface; everything inside the agent loop is
- * painted there.
+ * Two WebSockets, one per concern:
  *
- * This sidebar runs a *parallel* JSON-RPC WebSocket to the same gateway
- * dispatcher and renders the structural metadata that PTY can't surface
- * to the surrounding chrome: model badge with live connection state,
- * model picker, error banner.
+ *   1. **JSON-RPC sidecar** (`GatewayClient` → /api/ws) — drives the
+ *      sidebar's own slot of the dashboard's in-process gateway.  Owns
+ *      the model badge / picker / connection state / error banner.
+ *      Independent of the PTY pane's session by design — those are the
+ *      pieces the sidebar needs to be able to drive directly (model
+ *      switch via slash.exec, etc.).
  *
- * Tool-call mirroring is intentionally NOT here. The PTY pane spawns
- * `hermes --tui` as a child process with its own `tui_gateway` and its
- * own `_sessions` dict; the WS sidecar runs in-process in the dashboard
- * server with a separate `_sessions` dict. Events emitted on the child's
- * gateway never cross the process boundary, so a sidebar listener on
- * `tool.start` would always be empty. Surfacing tool calls in the
- * sidebar requires cross-process event forwarding (PTY child opens a
- * back-WS to the dashboard, gateway tees emits onto both stdio and the
- * sidecar transport) — a follow-up that's a proper feature, not a
- * cosmetic add-on.
+ *   2. **Event subscriber** (/api/events?channel=…) — passive, receives
+ *      every dispatcher emit from the PTY-side `tui_gateway.entry` that
+ *      the dashboard fanned out.  This is how `tool.start/progress/
+ *      complete` from the agent loop reach the sidebar even though the
+ *      PTY child runs three processes deep from us.  The `channel` id
+ *      ties this listener to the same chat tab's PTY child — see
+ *      `ChatPage.tsx` for where the id is generated.
  *
- * Best-effort: if the WebSocket can't connect (older gateway, network
- * hiccup, missing token) the terminal pane keeps working unimpaired.
+ * Best-effort throughout: WS failures show in the badge / banner, the
+ * terminal pane keeps working unimpaired.
  */
 
 import { Badge } from "@/components/ui/badge";
@@ -32,6 +28,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 
 import { ModelPickerDialog } from "@/components/ModelPickerDialog";
+import { ToolCall, type ToolEntry } from "@/components/ToolCall";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
 
 import { AlertCircle, ChevronDown, RefreshCw } from "lucide-react";
@@ -43,6 +40,13 @@ interface SessionInfo {
   provider?: string;
   credential_warning?: string;
 }
+
+interface RpcEnvelope {
+  method?: string;
+  params?: { type?: string; payload?: unknown };
+}
+
+const TOOL_LIMIT = 20;
 
 const STATE_LABEL: Record<ConnectionState, string> = {
   idle: "idle",
@@ -60,7 +64,11 @@ const STATE_TONE: Record<ConnectionState, string> = {
   error: "bg-destructive/10 text-destructive",
 };
 
-export function ChatSidebar() {
+interface ChatSidebarProps {
+  channel: string;
+}
+
+export function ChatSidebar({ channel }: ChatSidebarProps) {
   // `version` bumps on reconnect; gw is derived so we never call setState
   // for it inside an effect (React 19's set-state-in-effect rule). The
   // counter is the dependency on purpose — it's not read in the memo body,
@@ -72,6 +80,7 @@ export function ChatSidebar() {
   const [state, setState] = useState<ConnectionState>("idle");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [info, setInfo] = useState<SessionInfo>({});
+  const [tools, setTools] = useState<ToolEntry[]>([]);
   const [modelOpen, setModelOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -116,8 +125,116 @@ export function ChatSidebar() {
     };
   }, [gw]);
 
+  // Event subscriber WebSocket — receives the rebroadcast of every
+  // dispatcher emit from the PTY child's gateway.  See /api/pub +
+  // /api/events in hermes_cli/web_server.py for the broadcast hop.
+  useEffect(() => {
+    const token = window.__HERMES_SESSION_TOKEN__;
+
+    if (!token || !channel) {
+      return;
+    }
+
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const qs = new URLSearchParams({ token, channel });
+    const ws = new WebSocket(
+      `${proto}//${window.location.host}/api/events?${qs.toString()}`,
+    );
+
+    ws.addEventListener("message", (ev) => {
+      let frame: RpcEnvelope;
+
+      try {
+        frame = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+
+      if (frame.method !== "event" || !frame.params) {
+        return;
+      }
+
+      const { type, payload } = frame.params;
+
+      if (type === "tool.start") {
+        const p = payload as
+          | { tool_id?: string; name?: string; context?: string }
+          | undefined;
+        const toolId = p?.tool_id;
+
+        if (!toolId) {
+          return;
+        }
+
+        setTools((prev) =>
+          [
+            ...prev,
+            {
+              kind: "tool" as const,
+              id: `tool-${toolId}-${prev.length}`,
+              tool_id: toolId,
+              name: p?.name ?? "tool",
+              context: p?.context,
+              status: "running" as const,
+              startedAt: Date.now(),
+            },
+          ].slice(-TOOL_LIMIT),
+        );
+      } else if (type === "tool.progress") {
+        const p = payload as
+          | { name?: string; preview?: string }
+          | undefined;
+
+        if (!p?.name || !p.preview) {
+          return;
+        }
+
+        setTools((prev) =>
+          prev.map((t) =>
+            t.status === "running" && t.name === p.name
+              ? { ...t, preview: p.preview }
+              : t,
+          ),
+        );
+      } else if (type === "tool.complete") {
+        const p = payload as
+          | {
+              tool_id?: string;
+              summary?: string;
+              error?: string;
+              inline_diff?: string;
+            }
+          | undefined;
+
+        if (!p?.tool_id) {
+          return;
+        }
+
+        setTools((prev) =>
+          prev.map((t) =>
+            t.tool_id === p.tool_id
+              ? {
+                  ...t,
+                  status: p.error ? "error" : "done",
+                  summary: p.summary,
+                  error: p.error,
+                  inline_diff: p.inline_diff,
+                  completedAt: Date.now(),
+                }
+              : t,
+          ),
+        );
+      }
+    });
+
+    return () => {
+      ws.close();
+    };
+  }, [channel, version]);
+
   const reconnect = useCallback(() => {
     setError(null);
+    setTools([]);
     setVersion((v) => v + 1);
   }, []);
 
@@ -174,7 +291,7 @@ export function ChatSidebar() {
           <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
 
           <div className="min-w-0 flex-1">
-            <div className="break-words text-destructive">{banner}</div>
+            <div className="wrap-break-word text-destructive">{banner}</div>
 
             {error && (
               <Button
@@ -191,10 +308,19 @@ export function ChatSidebar() {
         </Card>
       )}
 
-      <Card className="flex flex-1 flex-col items-center justify-center gap-1 px-3 py-4 text-center text-xs text-muted-foreground">
-        <div className="font-medium">tool calls render in the terminal</div>
-        <div className="text-[0.7rem] opacity-80">
-          cross-process forwarding to this sidecar lands in a follow-up
+      <Card className="flex min-h-0 flex-1 flex-col px-2 py-2">
+        <div className="px-1 pb-2 text-xs uppercase tracking-wider text-muted-foreground">
+          tools
+        </div>
+
+        <div className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto pr-1">
+          {tools.length === 0 ? (
+            <div className="px-2 py-4 text-center text-xs text-muted-foreground">
+              no tool calls yet
+            </div>
+          ) : (
+            tools.map((t) => <ToolCall key={t.id} tool={t} />)
+          )}
         </div>
       </Card>
 

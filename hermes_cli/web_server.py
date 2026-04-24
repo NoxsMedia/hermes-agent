@@ -2284,13 +2284,22 @@ from hermes_cli.pty_bridge import PtyBridge, PtyUnavailableError
 
 _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
 _PTY_READ_CHUNK_TIMEOUT = 0.2
+_VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 # Starlette's TestClient reports the peer as "testclient"; treat it as
 # loopback so tests don't need to rewrite request scope.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
 
+# Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
+# and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
+# the chat tab generates on mount; entries auto-evict when the last subscriber
+# drops AND the publisher has disconnected.
+_event_channels: dict[str, set] = {}
+_event_lock = asyncio.Lock()
+
 
 def _resolve_chat_argv(
     resume: Optional[str] = None,
+    sidecar_url: Optional[str] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve the argv + cwd + env for the chat PTY.
 
@@ -2302,15 +2311,61 @@ def _resolve_chat_argv(
     matching what ``hermes_cli.main._launch_tui`` does for the CLI path.
     Appending ``--resume <id>`` to argv doesn't work because ``ui-tui`` does
     not parse its argv.
+
+    `sidecar_url` (when set) is forwarded as ``HERMES_TUI_SIDECAR_URL`` so
+    the spawned ``tui_gateway.entry`` can mirror dispatcher emits to the
+    dashboard's ``/api/pub`` endpoint (see :func:`pub_ws`).
     """
     from hermes_cli.main import PROJECT_ROOT, _make_tui_argv
 
     argv, cwd = _make_tui_argv(PROJECT_ROOT / "ui-tui", tui_dev=False)
     env: Optional[dict] = None
-    if resume:
+
+    if resume or sidecar_url:
         env = os.environ.copy()
-        env["HERMES_TUI_RESUME"] = resume
+
+        if resume:
+            env["HERMES_TUI_RESUME"] = resume
+
+        if sidecar_url:
+            env["HERMES_TUI_SIDECAR_URL"] = sidecar_url
+
     return list(argv), str(cwd) if cwd else None, env
+
+
+def _build_sidecar_url(channel: str) -> Optional[str]:
+    """ws:// URL the PTY child should publish events to, or None when unbound."""
+    host = getattr(app.state, "bound_host", None)
+    port = getattr(app.state, "bound_port", None)
+
+    if not host or not port:
+        return None
+
+    netloc = f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
+    qs = urllib.parse.urlencode({"token": _SESSION_TOKEN, "channel": channel})
+
+    return f"ws://{netloc}/api/pub?{qs}"
+
+
+async def _broadcast_event(channel: str, payload: str) -> None:
+    """Fan out one publisher frame to every subscriber on `channel`."""
+    async with _event_lock:
+        subs = list(_event_channels.get(channel, ()))
+
+    for sub in subs:
+        try:
+            await sub.send_text(payload)
+        except Exception:
+            # Subscriber went away mid-send; the /api/events finally clause
+            # will remove it from the registry on its next iteration.
+            pass
+
+
+def _channel_or_close_code(ws: WebSocket) -> Optional[str]:
+    """Return the channel id from the query string or None if invalid."""
+    channel = ws.query_params.get("channel", "")
+
+    return channel if _VALID_CHANNEL_RE.match(channel) else None
 
 
 @app.websocket("/api/pty")
@@ -2331,8 +2386,11 @@ async def pty_ws(ws: WebSocket) -> None:
 
     # --- spawn PTY ------------------------------------------------------
     resume = ws.query_params.get("resume") or None
+    channel = _channel_or_close_code(ws)
+    sidecar_url = _build_sidecar_url(channel) if channel else None
+
     try:
-        argv, cwd, env = _resolve_chat_argv(resume=resume)
+        argv, cwd, env = _resolve_chat_argv(resume=resume, sidecar_url=sidecar_url)
     except SystemExit as exc:
         # _make_tui_argv calls sys.exit(1) when node/npm is missing.
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
@@ -2431,6 +2489,85 @@ async def gateway_ws(ws: WebSocket) -> None:
     from tui_gateway.ws import handle_ws
 
     await handle_ws(ws)
+
+
+# ---------------------------------------------------------------------------
+# /api/pub + /api/events — chat-tab event broadcast.
+#
+# The PTY-side ``tui_gateway.entry`` opens /api/pub at startup (driven by
+# HERMES_TUI_SIDECAR_URL set in /api/pty's PTY env) and writes every
+# dispatcher emit through it.  The dashboard fans those frames out to any
+# subscriber that opened /api/events on the same channel id.  This is what
+# gives the React sidebar its tool-call feed without breaking the PTY
+# child's stdio handshake with Ink.
+# ---------------------------------------------------------------------------
+
+
+@app.websocket("/api/pub")
+async def pub_ws(ws: WebSocket) -> None:
+    token = ws.query_params.get("token", "")
+    if not hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+        await ws.close(code=4401)
+        return
+
+    client_host = ws.client.host if ws.client else ""
+    if client_host and client_host not in _LOOPBACK_HOSTS:
+        await ws.close(code=4403)
+        return
+
+    channel = _channel_or_close_code(ws)
+    if not channel:
+        await ws.close(code=4400)
+        return
+
+    await ws.accept()
+
+    try:
+        while True:
+            await _broadcast_event(channel, await ws.receive_text())
+    except WebSocketDisconnect:
+        pass
+
+
+@app.websocket("/api/events")
+async def events_ws(ws: WebSocket) -> None:
+    token = ws.query_params.get("token", "")
+    if not hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+        await ws.close(code=4401)
+        return
+
+    client_host = ws.client.host if ws.client else ""
+    if client_host and client_host not in _LOOPBACK_HOSTS:
+        await ws.close(code=4403)
+        return
+
+    channel = _channel_or_close_code(ws)
+    if not channel:
+        await ws.close(code=4400)
+        return
+
+    await ws.accept()
+
+    async with _event_lock:
+        _event_channels.setdefault(channel, set()).add(ws)
+
+    try:
+        while True:
+            # Subscribers don't speak — the receive() just blocks until
+            # disconnect so the connection stays open as long as the
+            # browser holds it.
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        async with _event_lock:
+            subs = _event_channels.get(channel)
+
+            if subs is not None:
+                subs.discard(ws)
+
+                if not subs:
+                    _event_channels.pop(channel, None)
 
 
 def mount_spa(application: FastAPI):
@@ -2987,7 +3124,10 @@ def start_server(
 
     # Record the bound host so host_header_middleware can validate incoming
     # Host headers against it. Defends against DNS rebinding (GHSA-ppp5-vxwm-4cf7).
+    # bound_port is also stashed so /api/pty can build the back-WS URL the
+    # PTY child uses to publish events to the dashboard sidebar.
     app.state.bound_host = host
+    app.state.bound_port = port
 
     if open_browser:
         import webbrowser

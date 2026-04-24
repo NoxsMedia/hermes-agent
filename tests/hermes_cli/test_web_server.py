@@ -1723,7 +1723,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            lambda resume=None: (["/bin/cat"], None, None),
+            lambda resume=None, sidecar_url=None: (["/bin/cat"], None, None),
         )
         from starlette.websockets import WebSocketDisconnect
 
@@ -1736,7 +1736,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            lambda resume=None: (["/bin/cat"], None, None),
+            lambda resume=None, sidecar_url=None: (["/bin/cat"], None, None),
         )
         from starlette.websockets import WebSocketDisconnect
 
@@ -1749,7 +1749,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            lambda resume=None: (
+            lambda resume=None, sidecar_url=None: (
                 ["/bin/sh", "-c", "printf hermes-ws-ok"],
                 None,
                 None,
@@ -1779,7 +1779,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            lambda resume=None: (["/bin/cat"], None, None),
+            lambda resume=None, sidecar_url=None: (["/bin/cat"], None, None),
         )
         with self.client.websocket_connect(self._url()) as conn:
             conn.send_bytes(b"round-trip-payload\n")
@@ -1802,7 +1802,7 @@ class TestPtyWebSocket:
             self.ws_module,
             "_resolve_chat_argv",
             # sleep gives the test time to push the resize before tput runs
-            lambda resume=None: (
+            lambda resume=None, sidecar_url=None: (
                 ["/bin/sh", "-c", "sleep 0.15; tput cols; tput lines"],
                 None,
                 None,
@@ -1831,7 +1831,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            lambda resume=None: (["/bin/cat"], None, None),
+            lambda resume=None, sidecar_url=None: (["/bin/cat"], None, None),
         )
         # Patch PtyBridge.spawn at the web_server module's binding.
         import hermes_cli.web_server as ws_mod
@@ -1846,7 +1846,7 @@ class TestPtyWebSocket:
     def test_resume_parameter_is_forwarded_to_argv(self, monkeypatch):
         captured: dict = {}
 
-        def fake_resolve(resume=None):
+        def fake_resolve(resume=None, sidecar_url=None):
             captured["resume"] = resume
             return (["/bin/sh", "-c", "printf resume-arg-ok"], None, None)
 
@@ -1859,3 +1859,59 @@ class TestPtyWebSocket:
             except Exception:
                 pass
         assert captured.get("resume") == "sess-42"
+
+    def test_channel_param_propagates_sidecar_url(self, monkeypatch):
+        """When /api/pty is opened with ?channel=, the PTY child gets a
+        HERMES_TUI_SIDECAR_URL env var pointing back at /api/pub on the
+        same channel — which is how tool events reach the dashboard sidebar."""
+        captured: dict = {}
+
+        def fake_resolve(resume=None, sidecar_url=None):
+            captured["sidecar_url"] = sidecar_url
+            return (["/bin/sh", "-c", "printf sidecar-ok"], None, None)
+
+        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv", fake_resolve)
+        monkeypatch.setattr(
+            self.ws_module.app.state, "bound_host", "127.0.0.1", raising=False
+        )
+        monkeypatch.setattr(
+            self.ws_module.app.state, "bound_port", 9119, raising=False
+        )
+
+        with self.client.websocket_connect(self._url(channel="abc-123")) as conn:
+            try:
+                conn.receive_bytes()
+            except Exception:
+                pass
+
+        url = captured.get("sidecar_url") or ""
+        assert url.startswith("ws://127.0.0.1:9119/api/pub?")
+        assert "channel=abc-123" in url
+        assert "token=" in url
+
+    def test_pub_broadcasts_to_events_subscribers(self, monkeypatch):
+        """Frame written to /api/pub is rebroadcast verbatim to every
+        /api/events subscriber on the same channel."""
+        from urllib.parse import urlencode
+
+        qs = urlencode({"token": self.token, "channel": "broadcast-test"})
+        pub_path = f"/api/pub?{qs}"
+        sub_path = f"/api/events?{qs}"
+
+        with self.client.websocket_connect(sub_path) as sub:
+            with self.client.websocket_connect(pub_path) as pub:
+                pub.send_text('{"type":"tool.start","payload":{"tool_id":"t1"}}')
+                received = sub.receive_text()
+
+        assert "tool.start" in received
+        assert '"tool_id":"t1"' in received
+
+    def test_events_rejects_missing_channel(self):
+        from starlette.websockets import WebSocketDisconnect
+
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with self.client.websocket_connect(
+                f"/api/events?token={self.token}"
+            ):
+                pass
+        assert exc.value.code == 4400
