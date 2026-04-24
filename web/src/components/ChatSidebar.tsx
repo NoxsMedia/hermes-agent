@@ -8,11 +8,20 @@
  * painted there.
  *
  * This sidebar runs a *parallel* JSON-RPC WebSocket to the same gateway
- * and renders the structural metadata that PTY can't surface to React
- * chrome: model badge with live connection state, tool-call list, model
- * picker. Anything destructive (slash exec, model switch) is handed off
- * to the TUI via the gateway so the terminal pane stays the source of
- * truth.
+ * dispatcher and renders the structural metadata that PTY can't surface
+ * to the surrounding chrome: model badge with live connection state,
+ * model picker, error banner.
+ *
+ * Tool-call mirroring is intentionally NOT here. The PTY pane spawns
+ * `hermes --tui` as a child process with its own `tui_gateway` and its
+ * own `_sessions` dict; the WS sidecar runs in-process in the dashboard
+ * server with a separate `_sessions` dict. Events emitted on the child's
+ * gateway never cross the process boundary, so a sidebar listener on
+ * `tool.start` would always be empty. Surfacing tool calls in the
+ * sidebar requires cross-process event forwarding (PTY child opens a
+ * back-WS to the dashboard, gateway tees emits onto both stdio and the
+ * sidecar transport) — a follow-up that's a proper feature, not a
+ * cosmetic add-on.
  *
  * Best-effort: if the WebSocket can't connect (older gateway, network
  * hiccup, missing token) the terminal pane keeps working unimpaired.
@@ -23,7 +32,6 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 
 import { ModelPickerDialog } from "@/components/ModelPickerDialog";
-import { ToolCall, type ToolEntry } from "@/components/ToolCall";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
 
 import { AlertCircle, ChevronDown, RefreshCw } from "lucide-react";
@@ -35,8 +43,6 @@ interface SessionInfo {
   provider?: string;
   credential_warning?: string;
 }
-
-const TOOL_LIMIT = 20;
 
 const STATE_LABEL: Record<ConnectionState, string> = {
   idle: "idle",
@@ -66,7 +72,6 @@ export function ChatSidebar() {
   const [state, setState] = useState<ConnectionState>("idle");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [info, setInfo] = useState<SessionInfo>({});
-  const [tools, setTools] = useState<ToolEntry[]>([]);
   const [modelOpen, setModelOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -83,78 +88,6 @@ export function ChatSidebar() {
       }
     });
 
-    const offToolStart = gw.on<{
-      tool_id: string;
-      name: string;
-      context?: string;
-    }>("tool.start", (ev) => {
-      const p = ev.payload;
-
-      if (!p?.tool_id) {
-        return;
-      }
-
-      setTools((prev) =>
-        [
-          ...prev,
-          {
-            kind: "tool" as const,
-            id: `tool-${p.tool_id}-${prev.length}`,
-            tool_id: p.tool_id,
-            name: p.name ?? "tool",
-            context: p.context,
-            status: "running" as const,
-            startedAt: Date.now(),
-          },
-        ].slice(-TOOL_LIMIT),
-      );
-    });
-
-    const offToolProgress = gw.on<{ name?: string; preview?: string }>(
-      "tool.progress",
-      (ev) => {
-        const { name, preview } = ev.payload ?? {};
-
-        if (!name || !preview) {
-          return;
-        }
-
-        setTools((prev) =>
-          prev.map((t) =>
-            t.status === "running" && t.name === name ? { ...t, preview } : t,
-          ),
-        );
-      },
-    );
-
-    const offToolComplete = gw.on<{
-      tool_id: string;
-      summary?: string;
-      error?: string;
-      inline_diff?: string;
-    }>("tool.complete", (ev) => {
-      const p = ev.payload;
-
-      if (!p?.tool_id) {
-        return;
-      }
-
-      setTools((prev) =>
-        prev.map((t) =>
-          t.tool_id === p.tool_id
-            ? {
-                ...t,
-                status: p.error ? "error" : "done",
-                summary: p.summary,
-                error: p.error,
-                inline_diff: p.inline_diff,
-                completedAt: Date.now(),
-              }
-            : t,
-        ),
-      );
-    });
-
     const offError = gw.on<{ message?: string }>("error", (ev) => {
       const message = ev.payload?.message;
 
@@ -163,9 +96,9 @@ export function ChatSidebar() {
       }
     });
 
-    // Adopt whichever session the gateway hands us. session.create is a
-    // no-op on the existing slot if the gateway already has an active
-    // session for this profile; either way we get a sid back to use.
+    // Adopt whichever session the gateway hands us. session.create on the
+    // sidecar is independent of the PTY pane's session by design — we
+    // only need a sid to drive the model picker's slash.exec calls.
     gw.connect()
       .then(() => gw.request<{ session_id: string }>("session.create", {}))
       .then((created) => {
@@ -178,9 +111,6 @@ export function ChatSidebar() {
     return () => {
       offState();
       offSessionInfo();
-      offToolStart();
-      offToolProgress();
-      offToolComplete();
       offError();
       gw.close();
     };
@@ -188,7 +118,6 @@ export function ChatSidebar() {
 
   const reconnect = useCallback(() => {
     setError(null);
-    setTools([]);
     setVersion((v) => v + 1);
   }, []);
 
@@ -262,19 +191,10 @@ export function ChatSidebar() {
         </Card>
       )}
 
-      <Card className="flex min-h-0 flex-1 flex-col px-2 py-2">
-        <div className="px-1 pb-2 text-xs uppercase tracking-wider text-muted-foreground">
-          tools
-        </div>
-
-        <div className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto pr-1">
-          {tools.length === 0 ? (
-            <div className="px-2 py-4 text-center text-xs text-muted-foreground">
-              no tool calls yet
-            </div>
-          ) : (
-            tools.map((t) => <ToolCall key={t.id} tool={t} />)
-          )}
+      <Card className="flex flex-1 flex-col items-center justify-center gap-1 px-3 py-4 text-center text-xs text-muted-foreground">
+        <div className="font-medium">tool calls render in the terminal</div>
+        <div className="text-[0.7rem] opacity-80">
+          cross-process forwarding to this sidecar lands in a follow-up
         </div>
       </Card>
 
