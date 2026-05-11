@@ -3066,18 +3066,59 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 # where one app's refresh invalidates the other's session.
 # =============================================================================
 
+def _codex_state_from_auth_store(auth_store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    state = _load_provider_state(auth_store, "openai-codex")
+    if state:
+        return state
+
+    pool = auth_store.get("credential_pool")
+    if not isinstance(pool, dict):
+        pool = {}
+    entries = pool.get("openai-codex")
+    if not isinstance(entries, list):
+        entries = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("auth_type") != "oauth":
+            continue
+        access_token = entry.get("access_token")
+        if not isinstance(access_token, str) or not access_token.strip():
+            continue
+        return {
+            "tokens": {
+                "access_token": access_token,
+                "refresh_token": entry.get("refresh_token"),
+                "id_token": entry.get("id_token"),
+                "account_id": entry.get("account_id"),
+            },
+            "last_refresh": entry.get("last_refresh"),
+            "base_url": entry.get("base_url"),
+        }
+    return None
+
+
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
-    
+
     Returns dict with 'tokens' (access_token, refresh_token) and 'last_refresh'.
     Raises AuthError if no Codex tokens are stored.
+
+    Hermes may store Codex OAuth credentials in either the legacy
+    providers.openai-codex slot or the newer credential_pool.openai-codex
+    slot.  The pool fallback keeps legacy readers working for credentials
+    added through `hermes auth add openai-codex --type oauth`. In profile
+    mode, the global-root auth store is used as a read-only fallback when
+    the profile has no local Codex credentials.
     """
     if _lock:
         with _auth_store_lock():
             auth_store = _load_auth_store()
     else:
         auth_store = _load_auth_store()
-    state = _load_provider_state(auth_store, "openai-codex")
+    state = _codex_state_from_auth_store(auth_store)
+    if not state:
+        state = _codex_state_from_auth_store(_load_global_auth_store())
     if not state:
         raise AuthError(
             "No Codex credentials stored. Run `hermes auth` to authenticate.",
@@ -3112,6 +3153,7 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     return {
         "tokens": tokens,
         "last_refresh": state.get("last_refresh"),
+        "base_url": state.get("base_url"),
     }
 
 
@@ -3320,6 +3362,7 @@ def resolve_codex_runtime_credentials(
 
     base_url = (
         os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+        or str(data.get("base_url") or "").strip().rstrip("/")
         or DEFAULT_CODEX_BASE_URL
     )
 
